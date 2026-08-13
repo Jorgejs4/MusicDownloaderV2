@@ -1,0 +1,7 @@
+{
+  "authorization": "SAPISIDHASH <pegado-desde-ytmusicapi-setup>",
+  "cookie": "SAPISID=<tu-cookie>; __Secure-3PAPISID=<tu-cookie>; SID=<tu-cookie>",
+  "user-agent": "Mozilla/5.0 (...)",
+  "x-origin": "https://music.youtube.com",
+  "x-goog-authuser": "0"
+}
