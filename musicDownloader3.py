@@ -25,6 +25,27 @@ _safe_print("Motor de descarga (musicDownloader3) cargado correctamente.")
 def sanitize(name):
     return re.sub(r'[\\/*?:"<>|]', "", str(name or "")).strip()
 
+def get_ffmpeg_location():
+    """Localiza los binarios incluidos tanto en el proyecto como en el EXE."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        bundle_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        candidates.append(os.path.join(bundle_dir, "bin"))
+
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(module_dir, "bin"))
+    candidates.append(os.path.join(os.path.dirname(module_dir), "bin"))
+
+    for directory in candidates:
+        ffmpeg = os.path.join(directory, "ffmpeg.exe")
+        ffprobe = os.path.join(directory, "ffprobe.exe")
+        if os.path.isfile(ffmpeg) and os.path.isfile(ffprobe):
+            return directory
+
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return shutil.which("ffmpeg")
+    return None
+
 def get_ydl_opts(out_path):
     node_path = shutil.which("node") or r"C:\Program Files\nodejs\node.EXE"
     opts = {
@@ -43,6 +64,9 @@ def get_ydl_opts(out_path):
     }
     if node_path and os.path.exists(node_path):
         opts["jsruntimes"] = [node_path]
+    ffmpeg_location = get_ffmpeg_location()
+    if ffmpeg_location:
+        opts["ffmpeg_location"] = ffmpeg_location
     # No inyectar un po_token placeholder: puede invalidar la extracción.
     opts["extractor_args"] = {"youtube": {"player_client": ["web_creator", "android", "tv"]}}
     return opts
@@ -110,8 +134,14 @@ def normalize_loudness(file_path):
     
     temp_out = file_path.replace(".mp3", "_norm.mp3")
     # Filtro loudnorm: I=-14 (objetivo), TP=-1.0 (True Peak), LRA=11 (Rango dinámico)
+    ffmpeg_location = get_ffmpeg_location()
+    ffmpeg_command = (
+        os.path.join(ffmpeg_location, "ffmpeg.exe")
+        if ffmpeg_location and os.path.isdir(ffmpeg_location)
+        else (ffmpeg_location or "ffmpeg")
+    )
     cmd = [
-        "ffmpeg", "-y", "-i", file_path,
+        ffmpeg_command, "-y", "-i", file_path,
         "-filter:a", "loudnorm=I=-14:TP=-1.0:LRA=11",
         "-ar", "44100", "-b:a", "320k",
         temp_out
@@ -258,4 +288,3 @@ def get_lyrics(g, track):
 def get_synced(track):
     # La misma funcion fetch_lyrics devuelve sincronizada si está disponible
     return None # Por ahora devolvemos None para no duplicar en el .mp3 si queremos .lrc aparte
-

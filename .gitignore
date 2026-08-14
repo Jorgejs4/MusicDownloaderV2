@@ -84,5 +84,7 @@ keys.md
 Thumbs.db
 .idea/
 .vscode/
+.gradle/
+local.properties
 *.swp
 GEMINI.md

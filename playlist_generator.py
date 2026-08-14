@@ -35,7 +35,15 @@ def get_current_music_dir():
     return config.get_music_dir()
 
 def get_current_playlist_dir():
-    return os.path.join(get_current_music_dir(), "_Playlists")
+    """Devuelve la carpeta de playlists y garantiza que exista.
+
+    La descarga incremental actualiza las listas antes de que se ejecute
+    ``generate_playlists()``. Por eso no se puede asumir que esa carpeta ya
+    haya sido creada por la generación completa.
+    """
+    playlist_dir = os.path.join(get_current_music_dir(), "_Playlists")
+    os.makedirs(playlist_dir, exist_ok=True)
+    return playlist_dir
 
 def sanitize(name):
     return re.sub(r'[\\/*?:"<>|]', "", str(name).replace("/", " ")).strip()
@@ -116,6 +124,7 @@ def update_playlist_for_track(abs_path, genres, year):
     """AÃ±ade una canciÃ³n reciÃ©n descargada a las listas correspondientes."""
     music_dir = get_current_music_dir()
     playlist_dir = get_current_playlist_dir()
+    os.makedirs(playlist_dir, exist_ok=True)
     # Fix: Prepend ../ because playlists are in _Playlists/ subfolder
     rel_path = "../" + os.path.relpath(abs_path, music_dir).replace("\\", "/")
     

@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import time
+import hashlib
+import secrets
 from threading import Thread, Lock
 from urllib.parse import urlparse, parse_qs
 import urllib.request
@@ -42,6 +44,17 @@ _ZIP_JOB = {
     "size": 0,
     "error": None,
 }
+
+def get_sync_token():
+    """Token persistente para el cliente móvil de sincronización remota."""
+    from config_manager import config
+    general = config.settings.setdefault("general", {})
+    token = str(general.get("zrok_sync_token", "")).strip()
+    if not token:
+        token = secrets.token_urlsafe(32)
+        general["zrok_sync_token"] = token
+        config.save_settings()
+    return token
 
 def _runtime_base_dir():
     if getattr(sys, "frozen", False):
@@ -236,6 +249,10 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
                 self.send_zip_status(url.query)
             elif path == "/manifest.json":
                 self.serve_manifest()
+            elif path == "/sync/manifest":
+                self.send_sync_manifest(url.query)
+            elif path == "/sync/file":
+                self.serve_sync_file(url.query)
             else:
                 self.serve_ui()
         except (BrokenPipeError, ConnectionResetError):
@@ -246,6 +263,57 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(500, "Internal server error")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+    def _sync_authorized(self, query):
+        params = parse_qs(query)
+        supplied = params.get("token", [""])[0] or self.headers.get("X-Music-Sync-Token", "")
+        return secrets.compare_digest(str(supplied), get_sync_token())
+
+    def _send_json(self, payload, status=200):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_sync_manifest(self, query=""):
+        if not self._sync_authorized(query):
+            self.send_error(401, "Token de sincronizacion no valido")
+            return
+        from config_manager import config
+        root = os.path.abspath(config.get_music_dir())
+        files = []
+        for item in _library_entries(root):
+            if not item["rel"].lower().endswith((".mp3", ".lrc", ".m3u8")):
+                continue
+            digest = hashlib.sha256()
+            try:
+                with open(item["abs"], "rb") as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(block)
+            except OSError:
+                continue
+            files.append({"path": item["rel"], "size": item["size"], "sha256": digest.hexdigest()})
+        self._send_json({"version": 1, "playlist": config.get_active_playlist(), "files": files})
+
+    def serve_sync_file(self, query=""):
+        if not self._sync_authorized(query):
+            self.send_error(401, "Token de sincronizacion no valido")
+            return
+        from config_manager import config
+        params = parse_qs(query)
+        rel_path = params.get("path", [""])[0]
+        root = os.path.abspath(config.get_music_dir())
+        abs_path = os.path.abspath(os.path.join(root, rel_path))
+        if not rel_path or (abs_path != root and not abs_path.startswith(root + os.sep)):
+            self.send_error(403, "Ruta no permitida")
+            return
+        if not os.path.isfile(abs_path) or not abs_path.lower().endswith((".mp3", ".lrc", ".m3u8")):
+            self.send_error(404, "Archivo no encontrado")
+            return
+        self.serve_static_file(abs_path, "audio/mpeg" if abs_path.lower().endswith(".mp3") else "application/octet-stream", os.path.basename(abs_path))
 
     def serve_health(self):
         data = b"ok"
@@ -263,11 +331,13 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
         current, _ = _is_zip_current(root, layout)
         if not current:
             _start_zip_job(root, layout, type(self).progress_callback)
-            data = (
-                b"ZIP preparandose en el PC. Vuelve a intentarlo cuando el estado indique que esta listo."
-            )
+            data = json.dumps({
+                "ready": False,
+                "message": "El ZIP se está preparando en el PC.",
+                "status_url": "/zip_status?layout=" + layout,
+            }).encode("utf-8")
             self.send_response(202)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -611,7 +681,8 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
       try {{
         const res = await fetch("/get_library", {{ cache: "no-store" }});
         allSongs = await res.json();
-        countBadge.textContent = `${{allSongs.length}} canciones disponibles`;
+        const songCount = allSongs.filter(s => /\.mp3$/i.test(s.path)).length;
+        countBadge.textContent = `${{songCount}} canciones disponibles`;
         renderSongs(allSongs);
       }} catch(e) {{
         countBadge.textContent = "Error al leer biblioteca";
@@ -686,6 +757,81 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
       zipStatus.textContent = "Preparando ZIP en PC...";
       await fetch("/prepare_zip?layout=audio_songs");
       setTimeout(checkZip, 1000);
+    }});
+
+    // Esperar a que el ZIP exista evita que el navegador guarde la respuesta
+    // HTTP 202 (texto de "preparando") como si fuera un archivo .txt.
+    document.getElementById("direct-zip-btn").addEventListener("click", async (event) => {{
+      event.preventDefault();
+      const link = event.currentTarget;
+      link.textContent = "⏳ Preparando ZIP...";
+      link.style.pointerEvents = "none";
+      try {{
+        await fetch("/prepare_zip?layout=audio_songs", {{ cache: "no-store" }});
+        const waitForZip = async () => {{
+          const info = await fetch("/zip_status?layout=audio_songs", {{ cache: "no-store" }}).then(r => r.json());
+          if (info.state === "ready") {{
+            window.location.href = "/download_zip?layout=audio_songs";
+            return;
+          }}
+          if (info.state === "error") throw new Error(info.error || info.message);
+          link.textContent = info.message || "⏳ Preparando ZIP...";
+          setTimeout(waitForZip, 1500);
+        }};
+        await waitForZip();
+      }} catch (e) {{
+        link.textContent = "❌ Error preparando ZIP";
+        link.title = e.message;
+        link.style.pointerEvents = "auto";
+      }}
+    }});
+
+    // Esta función solo está disponible en Chrome/Edge de escritorio.
+    // Permite elegir una carpeta local y copiar la biblioteca manteniendo
+    // la misma estructura de carpetas que tiene el PC.
+    const syncFolderBtn = document.getElementById("sync-folder-btn");
+    syncFolderBtn.addEventListener("click", async () => {{
+      if (!window.showDirectoryPicker) {{
+        zipStatus.textContent = "Esta función requiere Chrome o Edge en un PC. En móvil usa Descargar ZIP.";
+        return;
+      }}
+
+      let destination;
+      try {{
+        destination = await window.showDirectoryPicker({{ mode: "readwrite" }});
+      }} catch (e) {{
+        if (e.name !== "AbortError") zipStatus.textContent = "No se pudo abrir la carpeta de destino.";
+        return;
+      }}
+
+      const files = allSongs.filter(s => /\.(mp3|lrc|m3u8)$/i.test(s.path));
+      syncFolderBtn.disabled = true;
+      syncFolderBtn.textContent = "Sincronizando...";
+      zipProgress.hidden = false;
+      zipProgress.max = files.length || 1;
+      zipProgress.value = 0;
+
+      try {{
+        for (let i = 0; i < files.length; i++) {{
+          const relativeParts = files[i].path.split("/").filter(Boolean);
+          const filename = relativeParts.pop();
+          let folder = destination;
+          for (const part of relativeParts) folder = await folder.getDirectoryHandle(part, {{ create: true }});
+
+          const response = await fetch("/download_file?path=" + encodeURIComponent(files[i].path), {{ cache: "no-store" }});
+          if (!response.ok) throw new Error("HTTP " + response.status + " para " + files[i].path);
+          const writable = await (await folder.getFileHandle(filename, {{ create: true }})).createWritable();
+          await response.body.pipeTo(writable);
+          zipProgress.value = i + 1;
+          zipStatus.textContent = `Copiados ${{i + 1}}/${{files.length}} archivos`;
+        }}
+        zipStatus.textContent = `Sincronización terminada: ${{files.length}} archivos.`;
+      }} catch (e) {{
+        zipStatus.textContent = "Sincronización detenida: " + e.message;
+      }} finally {{
+        syncFolderBtn.disabled = false;
+        syncFolderBtn.textContent = "Sincronizar a Carpeta (Chrome PC)";
+      }}
     }});
 
     loadLibrary();

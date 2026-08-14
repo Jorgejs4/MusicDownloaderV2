@@ -1,15 +1,26 @@
-import customtkinter as ctk
 import os
 import sys
+
+# PyInstaller 6.x apunta Tcl a la raíz de _tcl_data, pero Tcl 8.6 necesita
+# conservar la subcarpeta tcl8.6 para localizar init.tcl.
+if getattr(sys, "frozen", False):
+    _bundle_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    os.environ["TCL_LIBRARY"] = os.path.join(_bundle_dir, "_tcl_data", "tcl8.6")
+    os.environ["TK_LIBRARY"] = os.path.join(_bundle_dir, "_tk_data", "tk8.6")
+
+import customtkinter as ctk
 import threading
 import subprocess
 import queue
+import time
+import urllib.parse
 from PIL import Image, ImageTk
 from config_manager import config
 from exportify_bot import run_exportify_bot
 from music_csv_auto import DownloadEngine
 from auto_sync import SyncEngine
-from qr_sync import QRServer
+from adb_sync import ADBSyncEngine
+from qr_sync import QRServer, get_sync_token
 import playlist_generator
 import restaurar_respaldo
 
@@ -213,6 +224,13 @@ class App(ctk.CTk):
         new_ip = ctk.CTkInputDialog(text=f"Nueva Dirección IP (LAN):\nActual: {data['ssh_ip']}", title="Ajustes IP").get_input()
         if new_ip:
             data["ssh_ip"] = new_ip
+        adb_address = ctk.CTkInputDialog(
+            text=f"Dirección ADB inalámbrica (ej. 192.168.1.50:37891):\nActual: {data.get('adb_address', '')}\n\nDéjalo vacío para usar USB.",
+            title="Ajustes ADB",
+        ).get_input()
+        if adb_address is not None:
+            data["adb_address"] = adb_address.strip()
+        if new_ip or adb_address is not None:
             config.save_settings()
             self.refresh_devices_list()
 
@@ -265,33 +283,56 @@ class App(ctk.CTk):
         def _remote_task():
             import re
             try:
+                # El arranque del servidor local es asíncrono; esperar a que
+                # exista antes de publicar el puerto para evitar shares rotos.
+                deadline = time.time() + 10
+                while not self.qr_server.server and time.time() < deadline:
+                    time.sleep(0.1)
+                if not self.qr_server.server:
+                    raise RuntimeError("El servidor local QR no llegó a iniciar")
+
+                if getattr(self, "zrok_proc", None) and self.zrok_proc.poll() is None:
+                    self.zrok_proc.terminate()
+
                 # 1. Intentar Zrok primero
                 port = self.qr_server.port
-                cmd = f"zrok share public http://localhost:{port} --headless"
+                cmd = f"zrok share public http://127.0.0.1:{port} --headless --force-local --backend-mode proxy"
                 self.zrok_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
                 found_url = None
                 for line in self.zrok_proc.stdout:
-                    if "https://" in line:
-                        match = re.search(r"https://[a-z0-9-.]+\.zrok\.io", line)
-                        if match:
-                            temp_url = match.group(0)
-                            if "api-v1" in temp_url:
-                                continue
-                            found_url = temp_url
+                    clean_line = line.strip()
+                    if clean_line:
+                        self.ui_call(self.append_log, f"   [zrok] {clean_line}\n")
+                    # zrok 1.x emite la URL como JSON en stderr, que aquí se
+                    # mezcla con stdout: {"msg":"... https://...share.zrok.io"}.
+                    matches = re.findall(r"https://[A-Za-z0-9.-]+\.zrok\.(?:io|app)", line)
+                    for temp_url in matches:
+                        if "api-v1" not in temp_url:
+                            found_url = temp_url.rstrip(".,)")
                             break
+                    if found_url:
+                        break
                 
                 if found_url:
-                    img_qr, _ = self.qr_server.generate_qr(override_url=found_url)
-                    self.ui_call(self._show_qr, img_qr, found_url)
-                    self.ui_call(self.append_log, f"✅ Acceso Remoto Activo (Zrok): {found_url}\n")
+                    if not self.qr_server._wait_for_public_health(found_url, timeout=20):
+                        raise RuntimeError(f"zrok publicó {found_url}, pero no alcanza /healthz")
+                    sync_url = found_url + "?token=" + urllib.parse.quote(get_sync_token())
+                    img_qr, _ = self.qr_server.generate_qr(override_url=sync_url)
+                    self.ui_call(self._show_qr, img_qr, sync_url)
+                    self.ui_call(self.append_log, f"✅ Acceso Remoto Activo (Zrok): {sync_url}\n")
                     self.ui_call(self.zrok_btn.configure, state="normal", text="REMOTO ZROK ACTIVO", fg_color="#1DB954")
                 else:
+                    exit_code = self.zrok_proc.poll()
+                    if exit_code not in (None, 0):
+                        raise RuntimeError(f"zrok terminó con código {exit_code}; revisa el log [zrok]")
                     # 2. Fallback a Cloudflare
                     self.ui_call(self.append_log, "⚠️ Zrok no disponible, intentando Cloudflare...\n")
                     img_qr, url = self.qr_server.generate_qr(require_public=True)
-                    self.ui_call(self._show_qr, img_qr, url)
-                    self.ui_call(self.append_log, f"✅ Acceso Remoto Activo (Cloudflare): {url}\n")
+                    sync_url = url.rstrip("/") + "?token=" + urllib.parse.quote(get_sync_token())
+                    img_qr, _ = self.qr_server.generate_qr(override_url=sync_url)
+                    self.ui_call(self._show_qr, img_qr, sync_url)
+                    self.ui_call(self.append_log, f"✅ Acceso Remoto Activo (Cloudflare): {sync_url}\n")
                     self.ui_call(self.zrok_btn.configure, state="normal", text="REMOTO CLOUDFLARE ACTIVO", fg_color="#2f80ed")
 
             except Exception as e:
@@ -325,6 +366,9 @@ class App(ctk.CTk):
             threading.Thread(target=_start, daemon=True).start()
 
         else:
+            if getattr(self, "zrok_proc", None) and self.zrok_proc.poll() is None:
+                self.zrok_proc.terminate()
+                self.zrok_proc = None
             self.qr_server.stop()
             self.qr_image_label.configure(image=None, text="QR no activo\nPresiona un botón abajo")
             self.qr_url_label.configure(text="")
@@ -396,11 +440,12 @@ class App(ctk.CTk):
         ctk.CTkLabel(container, text="Método de Sincronización Preferido:", 
                      font=ctk.CTkFont(size=14, weight="bold")).grid(row=2, column=0, pady=(10, 5))
         
-        self.sync_method_menu = ctk.CTkOptionMenu(container, values=["SSH (Automático)", "QR (Manual)"], 
+        self.sync_method_menu = ctk.CTkOptionMenu(container, values=["SSH (Automático)", "ADB (USB / Wi-Fi)", "QR (Manual)"],
                                                  width=300,
                                                  command=self.change_sync_method)
         current_sync = config.settings["general"].get("sync_method", "SSH")
-        self.sync_method_menu.set("SSH (Automático)" if current_sync == "SSH" else "QR (Manual)")
+        labels = {"SSH": "SSH (Automático)", "ADB": "ADB (USB / Wi-Fi)", "QR": "QR (Manual)"}
+        self.sync_method_menu.set(labels.get(current_sync, "SSH (Automático)"))
         self.sync_method_menu.grid(row=3, column=0, pady=(0, 20))
 
         # 3. Restauración de Respaldo del Motor
@@ -424,7 +469,12 @@ class App(ctk.CTk):
             self.append_log(f"❌ Error al restaurar respaldo: {e}\n")
 
     def change_sync_method(self, val):
-        method = "SSH" if "SSH" in val else "QR"
+        if "ADB" in val:
+            method = "ADB"
+        elif "SSH" in val:
+            method = "SSH"
+        else:
+            method = "QR"
         config.settings["general"]["sync_method"] = method
         config.save_settings()
         self.append_log(f"⚙️ Método de entrega cambiado a: {method}\n")
@@ -602,12 +652,23 @@ class App(ctk.CTk):
                 # 2. Descargar canciones
                 remote_files = set()
                 dev = config.get_active_device()
-                if sync and config.settings["general"]["sync_method"] == "SSH":
+                sync_method = config.settings["general"].get("sync_method", "SSH")
+                if sync and sync_method == "SSH":
                     self.ui_call(self.append_log, "📥 Conectando con móvil para evitar duplicados remotos...\n")
                     sync_engine = SyncEngine(dev, local_root=music_dir)
                     conn_ok, _ = sync_engine.check_connection()
                     if conn_ok:
                         remote_files = sync_engine.get_remote_files()
+                elif sync and sync_method == "ADB":
+                    self.ui_call(self.append_log, "📥 Conectando con móvil por ADB para evitar duplicados...\n")
+                    sync_engine = ADBSyncEngine(dev, local_root=music_dir, progress_callback=lambda m: self.ui_call(self.append_log, f"   {m}\n"))
+                    conn_ok, conn_err = sync_engine.check_connection()
+                    if conn_ok:
+                        remote_files = sync_engine.get_remote_files()
+                    else:
+                        self.ui_call(self.append_log, f"⚠️ Error ADB: {conn_err}\n")
+                        self.ui_call(self.append_log, "⛔ Sincronización cancelada: conecta el móvil por ADB y vuelve a intentarlo.\n")
+                        return
 
                 dl = DownloadEngine(csv_path=csv_path, music_dir=music_dir)
                 dl_res = dl.run(
@@ -637,6 +698,18 @@ class App(ctk.CTk):
                                 self.ui_call(self.append_log, "✅ Sincronización terminada.\n")
                         else:
                             self.ui_call(self.append_log, f"⚠️ Error SSH: {conn_err}\n")
+                    elif sync_method == "ADB" and "SOLO PREPARAR" not in dev["name"].upper():
+                        sync_engine = ADBSyncEngine(dev, local_root=music_dir, progress_callback=lambda m: self.ui_call(self.append_log, f"   {m}\n"))
+                        conn_ok, conn_err = sync_engine.check_connection()
+                        if conn_ok:
+                            self.ui_call(self.append_log, f"📡 Enviando archivos por ADB a {dev['name']}...\n")
+                            sync_res = sync_engine.push_files()
+                            if sync_res.get("success"):
+                                self.ui_call(self.append_log, "✅ Sincronización ADB terminada.\n")
+                            else:
+                                self.ui_call(self.append_log, f"⚠️ Error ADB: {sync_res.get('msg', 'fallo en la transferencia')}\n")
+                        else:
+                            self.ui_call(self.append_log, f"⚠️ Error ADB: {conn_err}\n")
                 
                 self.ui_call(self.append_log, "🏁 Tarea completada.\n")
 

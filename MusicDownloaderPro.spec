@@ -2,12 +2,13 @@
 
 import os
 import sys
+import sysconfig
 from pathlib import Path
 
 # Detectar rutas base automáticamente
 PYTHON_HOME = Path(sys.prefix)
 TCL_DIR = PYTHON_HOME / "tcl"
-SITE_PACKAGES = Path(r"C:\Users\jorge\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages")
+SITE_PACKAGES = Path(sysconfig.get_paths()["purelib"])
 
 a = Analysis(
     ['main_gui.py'],
@@ -15,12 +16,17 @@ a = Analysis(
     binaries=[],
     datas=[
         (str(SITE_PACKAGES / 'customtkinter'), 'customtkinter/'),
-        (str(TCL_DIR / 'tcl8.6'), 'tcl'),
-        (str(TCL_DIR / 'tk8.6'), 'tk'),
+        (str(TCL_DIR / 'tcl8.6'), '_tcl_data/tcl8.6'),
+        (str(TCL_DIR / 'tk8.6'), '_tk_data/tk8.6'),
         ('bin/ffmpeg.exe', 'bin'),
         ('bin/ffprobe.exe', 'bin'),
     ],
     hiddenimports=[
+        # customtkinter importa estos módulos dinámicamente. La instalación
+        # de Python los tiene, pero PyInstaller los excluye si su autodetección
+        # de Tcl/Tk falla.
+        'tkinter',
+        '_tkinter',
         'musicDownloader3',
         'music_csv_auto',
         'restaurar_respaldo',
@@ -41,6 +47,18 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
+
+# PyInstaller 6.x puede excluir el paquete puro de tkinter cuando falla su
+# comprobación automática de Tcl/Tk, aunque _tkinter.pyd sí esté instalado.
+# Incluir explícitamente sus módulos evita el ModuleNotFoundError en el EXE.
+TKINTER_DIR = PYTHON_HOME / 'Lib' / 'tkinter'
+for tkinter_file in TKINTER_DIR.rglob('*.py'):
+    relative_name = tkinter_file.relative_to(TKINTER_DIR)
+    module_parts = list(relative_name.with_suffix('').parts)
+    if module_parts[-1] == '__init__':
+        module_parts.pop()
+    module_name = 'tkinter' + ('.' + '.'.join(module_parts) if module_parts else '')
+    a.pure.append((module_name, str(tkinter_file), 'PYMODULE'))
 
 pyz = PYZ(a.pure)
 

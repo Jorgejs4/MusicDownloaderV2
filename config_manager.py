@@ -31,7 +31,9 @@ DEFAULT_SETTINGS = {
             "ssh_ip": "192.168.1.242",
             "ssh_port": "8022",
             "remote_base": "~/Music-Downloader",
-            "remote_music": "/storage/emulated/0/Music/music downloader movil"
+            "remote_music": "/storage/emulated/0/Music/music downloader movil",
+            "adb_address": "",
+            "adb_serial": ""
         },
         "no_sync": {
             "name": "SOLO PREPARAR (Sin Sincro)",
@@ -39,7 +41,9 @@ DEFAULT_SETTINGS = {
             "ssh_ip": "0.0.0.0",
             "ssh_port": "0",
             "remote_base": "",
-            "remote_music": ""
+            "remote_music": "",
+            "adb_address": "",
+            "adb_serial": ""
         }
     },
     "general": {
@@ -92,15 +96,38 @@ class ConfigManager:
         return self.settings["active_profile"].get("playlist", "Liked")
 
     def get_music_dir(self):
-        """Devuelve la carpeta de música para el perfil activo."""
+        """Devuelve la carpeta de música para el perfil activo o la carpeta personalizada."""
+        # 1. Si el usuario configuró una carpeta personalizada válida
+        custom_dir = self.settings.get("general", {}).get("custom_music_dir")
+        if custom_dir and os.path.exists(custom_dir):
+            return os.path.abspath(custom_dir)
+
         acc = self.settings["active_profile"]["account"]
         pl = self.get_active_playlist()
-        # Sanitizar nombre de playlist para carpeta
         import re
         safe_pl = re.sub(r'[\\/*?:"<>|]', "", pl).strip()
         path = os.path.join(self.BASE_DIR, "canciones_auto", acc, safe_pl)
+        
+        # 2. Si la ruta por defecto está vacía, comprobar rutas alternativas conocidas
+        if not os.path.exists(path) or len(os.listdir(path)) == 0:
+            alt_paths = [
+                os.path.join(self.BASE_DIR, "canciones_auto", "Adriana", "Liked"),
+                os.path.join(self.BASE_DIR, "canciones_auto"),
+                os.path.abspath(os.path.join(self.BASE_DIR, "..", "..", "music downloader b3", "canciones_auto", acc, safe_pl)),
+                os.path.abspath(os.path.join(self.BASE_DIR, "..", "..", "music downloader b3", "canciones_auto", "Adriana", "Liked")),
+                os.path.abspath(os.path.join(self.BASE_DIR, "..", "..", "music downloader b3", "canciones_auto")),
+            ]
+            for alt in alt_paths:
+                if os.path.exists(alt) and any(f.endswith('.mp3') for _, _, files in os.walk(alt) for f in files):
+                    return alt
+
         os.makedirs(path, exist_ok=True)
         return path
+
+    def set_custom_music_dir(self, path):
+        if path and os.path.exists(path):
+            self.settings["general"]["custom_music_dir"] = os.path.abspath(path)
+            self.save_settings()
 
     def get_playlist_dir(self):
         """Devuelve la carpeta de listas para el perfil activo."""
@@ -125,7 +152,9 @@ class ConfigManager:
             "ssh_ip": clean_ip,
             "ssh_port": port,
             "remote_base": remote_base,
-            "remote_music": remote_music
+            "remote_music": remote_music,
+            "adb_address": "",
+            "adb_serial": ""
         }
         self.save_settings()
 
